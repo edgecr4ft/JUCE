@@ -145,25 +145,54 @@ public:
     {
         controller = &controllerIn;
         cache = CachedParamValues { getAllParamIDs (controllerIn) };
-        startTimerHz (60);
+        idleTicks = 0; // ONYX patch: idle slowdown, see timerCallback
+        startTimerHz (activeHz);
     }
 
-    void flush()
+    // ONYX patch: returns whether any cached value was sent to the controller.
+    bool flush()
     {
-        cache.ifSet ([this] (Steinberg::int32 index, float value)
+        bool flushedAny = false;
+
+        cache.ifSet ([this, &flushedAny] (Steinberg::int32 index, float value)
         {
+            flushedAny = true;
             controller->setParamNormalized (cache.getParamID (index), value);
         });
+
+        return flushedAny;
     }
 
 private:
+    // ONYX patch: upstream flushed at a fixed 60 Hz for the instance's whole life, even with no
+    // processor->controller traffic: per VST3 instance ~60 message-thread and ~180 timer-thread
+    // wakeups/s for nothing (Linux tablet, plugin-host + every instrument-host). After
+    // idleTicksBeforeSlowdown empty flushes (~0.5 s) drop to idleHz; the first flush that sends
+    // something goes back to activeHz. Worst case a change after a quiet spell reaches the editor
+    // one idle tick (100 ms) late; the host's own view (cachedParamValues) is not delayed, and
+    // getState/setState still flush synchronously.
     void timerCallback() override
     {
-        flush();
+        if (flush())
+        {
+            idleTicks = 0;
+
+            if (getTimerInterval() != 1000 / activeHz)
+                startTimerHz (activeHz);
+        }
+        else if (idleTicks < idleTicksBeforeSlowdown && ++idleTicks == idleTicksBeforeSlowdown)
+        {
+            startTimerHz (idleHz);
+        }
     }
+
+    static constexpr int activeHz = 60;               // ONYX patch
+    static constexpr int idleHz = 10;                 // ONYX patch
+    static constexpr int idleTicksBeforeSlowdown = 30; // ONYX patch
 
     CachedParamValues cache;
     Vst::IEditController* controller = nullptr;
+    int idleTicks = 0; // ONYX patch
 };
 
 //==============================================================================

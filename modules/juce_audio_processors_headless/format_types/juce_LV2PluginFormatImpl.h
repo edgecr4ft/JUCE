@@ -42,6 +42,23 @@
 
 #include <thread>
 
+// ONYX patch: the shared LV2 worker thread sleeps on a POSIX semaphore instead
+// of polling every 1 ms (~1000 wakeups/s per host process while any plugin with
+// the LV2 worker extension is loaded). sem_post() is lock-free and
+// async-signal-safe, so it may be called from the audio thread.
+#ifndef JUCE_ONYX_LV2_WORKER_SEMAPHORE
+ #if JUCE_LINUX || JUCE_BSD
+  #define JUCE_ONYX_LV2_WORKER_SEMAPHORE 1
+ #else
+  #define JUCE_ONYX_LV2_WORKER_SEMAPHORE 0
+ #endif
+#endif
+
+#if JUCE_ONYX_LV2_WORKER_SEMAPHORE
+ #include <semaphore.h>
+ #include <cerrno>
+#endif
+
 namespace juce
 {
 namespace lv2_host
@@ -1103,6 +1120,9 @@ public:
     ~SharedThreadedWorker() noexcept override
     {
         shouldExit = true;
+       #if JUCE_ONYX_LV2_WORKER_SEMAPHORE
+        workAvailable.post(); // ONYX patch: wake the worker so it sees shouldExit
+       #endif
         thread.join();
     }
 
@@ -1112,7 +1132,15 @@ public:
     {
         return registry.ifContains (submitter.handle, [&]
         {
-            return incoming.push (submitter, size, data);
+            const auto status = incoming.push (submitter, size, data);
+
+           #if JUCE_ONYX_LV2_WORKER_SEMAPHORE
+            // ONYX patch: called on the audio thread; sem_post is lock-free.
+            if (status == LV2_WORKER_SUCCESS)
+                workAvailable.post();
+           #endif
+
+            return status;
         });
     }
 
@@ -1144,6 +1172,39 @@ public:
 
 private:
     static constexpr auto queueSize = 8192;
+
+   #if JUCE_ONYX_LV2_WORKER_SEMAPHORE
+    // ONYX patch: counting semaphore, one post per queued work item (plus one on
+    // shutdown). Declared before `thread` so it exists before the thread starts.
+    struct Semaphore
+    {
+        Semaphore()  { sem_init (&sem, 0, 0); }
+        ~Semaphore() { sem_destroy (&sem); }
+
+        void post() noexcept { sem_post (&sem); }
+
+        void wait() noexcept
+        {
+            for (;;)
+            {
+                if (sem_wait (&sem) == 0)
+                    return;
+
+                if (errno != EINTR)
+                {
+                    // Semaphore unusable: degrade to the upstream 1 ms poll, never spin.
+                    std::this_thread::sleep_for (std::chrono::milliseconds (1));
+                    return;
+                }
+            }
+        }
+
+        sem_t sem;
+    };
+
+    Semaphore workAvailable;
+   #endif
+
     std::atomic<bool> shouldExit { false };
     WorkQueue<WorkSubmitter> incoming { queueSize };
     WorkQueue<WorkResponder> outgoing { queueSize };
@@ -1159,7 +1220,11 @@ private:
             if (! buffer.empty() && submitter.isValid())
                 submitter.doWork (Realtime::yes, (uint32_t) buffer.size(), buffer.data());
             else
+               #if JUCE_ONYX_LV2_WORKER_SEMAPHORE
+                workAvailable.wait(); // ONYX patch: block until schedule() or shutdown posts
+               #else
                 std::this_thread::sleep_for (std::chrono::milliseconds (1));
+               #endif
         }
     } };
     HandleRegistry registry;
@@ -1462,15 +1527,48 @@ struct UiMessageHeader
 class ProcessorToUi final : public MessageBufferInterface<UiMessageHeader>
 {
 public:
-    ProcessorToUi() { timer.startTimerHz (60); }
+    // ONYX patch: upstream started a 60 Hz timer here for the process's whole life (this object is
+    // a SharedResourcePointer, created with the first LV2 instance), even with no LV2 editor open:
+    // ~60 message-thread and ~180 timer-thread wakeups/s in plugin-host on the Linux tablet. The
+    // timer only services attached UIs (idle() + delivery), so it now runs only while one exists.
+    ProcessorToUi() = default;
 
-    void addUi    (UiEventListener& l)      { JUCE_ASSERT_MESSAGE_THREAD; activeUis.insert (&l); }
-    void removeUi (UiEventListener& l)      { JUCE_ASSERT_MESSAGE_THREAD; activeUis.erase (&l); }
+    void addUi (UiEventListener& l)
+    {
+        JUCE_ASSERT_MESSAGE_THREAD;
+        activeUis.insert (&l);
+
+        if (! timer.isTimerRunning()) // ONYX patch
+            timer.startTimerHz (60);
+    }
+
+    void removeUi (UiEventListener& l)
+    {
+        JUCE_ASSERT_MESSAGE_THREAD;
+        activeUis.erase (&l);
+
+        // ONYX patch: last UI gone: stop, and drop what is queued (it could only go to a removed UI,
+        // which upstream's next tick discarded too).
+        if (activeUis.empty())
+        {
+            timer.stopTimer();
+            processorToUi.readAllAndClear ([] (const UiMessageHeader&, uint32_t, const char*) {});
+        }
+    }
 
     void pushMessage (UiMessageHeader header, uint32_t size, const void* buffer) override
     {
+        // ONYX patch: a message for no UI (an instance without an open editor sends its output
+        // ports with a null listener) can never be delivered — the tick filters on activeUis.
+        // Dropping it here keeps the buffer from growing while the timer is stopped.
+        if (header.listener == nullptr)
+            return;
+
         processorToUi.pushMessage (header, size, buffer);
     }
+
+    // ONYX patch: test hook (test/plugin-host/test_juce_idle_timers.cpp).
+    bool isUiTimerRunning() const noexcept { return timer.isTimerRunning(); }
 
 private:
     Messages<UiMessageHeader, RealtimeWriteTrait> processorToUi;
